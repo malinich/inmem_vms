@@ -1,54 +1,75 @@
-from collections import defaultdict
-
-from flask import jsonify, make_response
+from flask import jsonify, make_response, current_app
 from flask_apispec import MethodResource
 
-from dbs import volumes, vms, volume_mounts
-from helpers import get_volume_mount
+from db import InMemoryDBVmVolumeMappingTable, VmVolumeMappingRow, VolumeRow, VmRow, UniqueError
 
 
 class VmsResource(MethodResource):
     def get(self):
-        current_volumes = defaultdict(list)
-        for volume in volume_mounts:
-            if volume['deleted']:
-                continue
-            current_volumes[volume['vm_id']].append(volume['volume_id'])
+        db: InMemoryDBVmVolumeMappingTable = current_app.db
+        vms_rows = db.get_vms()
 
-        current_vms = [{'name': vm['name'], 'volumes': current_volumes.get(vm['id'], [])} for vm in vms]
-        return jsonify(current_vms)
+        data = [{'name': k, 'volumes': [v.volume.id for v in vs]} for vr in vms_rows for k, vs in vr.items()]
+
+        return jsonify(data)
 
 
 class VolumesResource(MethodResource):
     def get(self):
-        current_volumes = {volume['id']: {'vm_id': None, 'past_mounts': [], 'id': volume['id']} for volume in volumes}
-        for volume_mount in volume_mounts:
-            if volume_mount['deleted']:
-                current_volumes[volume_mount['volume_id']]['past_mounts'].append(volume_mount['vm_id'])
-            else:
-                current_volumes[volume_mount['volume_id']]['vm_id'] = volume_mount['vm_id']
+        db: InMemoryDBVmVolumeMappingTable = current_app.db
+        volumes_rows = db.get_volumes()
 
-        return jsonify(current_volumes)
+        def func(id_, volumes):
+            ret = {'id': id_, 'vm_id': None, 'past_mounts': []}
+            for v in volumes:
+                if v.deleted:
+                    ret['past_mounts'].append(v.vm.id)
+                else:
+                    ret['vm_id'] = v.vm.id
+            return ret
+
+        data = [func(k, v) for row in volumes_rows for k, v in row.items()]
+
+        return jsonify(data)
 
 
 class UnmountView(MethodResource):
     def post(self, volume_id, vm_id):
-        vol_id = int(volume_id)
-        v_mount = get_volume_mount(vol_id, vm_id)
-        if v_mount is None:
+        volume_id = int(volume_id)
+
+        db: InMemoryDBVmVolumeMappingTable = current_app.db
+        volume: VolumeRow = db.get_volume(volume_id)
+        vm: VmRow = db.get_vm(vm_id)
+
+        v = db.unmount(volume, vm)
+
+        if v is None:
             response = make_response(jsonify({"error": "not mounted"}), 400)
             return response
-        v_mount['deleted'] = True
-        return jsonify(v_mount)
+
+        data = {
+            "id": v.volume.id,
+            "vm_id": v.vm.id,
+        }
+        return jsonify(data)
 
 
 class MountView(MethodResource):
     def post(self, volume_id, vm_id):
-        vol_id = int(volume_id)
-        v_mount = get_volume_mount(vol_id, vm_id)
-        if v_mount:
+        volume_id = int(volume_id)
+
+        db: InMemoryDBVmVolumeMappingTable = current_app.db
+        volume: VolumeRow = db.get_volume(volume_id)
+        vm: VmRow = db.get_vm(vm_id)
+
+        try:
+            v = db.mount(volume, vm)
+        except UniqueError:
             response = make_response(jsonify({"error": "already mounted"}), 400)
             return response
-        data = {'vm_id': vm_id, 'volume_id': vol_id, 'deleted': False}
-        volume_mounts.append(data)
+
+        data = {
+            "id": v.volume.id,
+            "vm_id": v.vm.id,
+        }
         return jsonify(data)
